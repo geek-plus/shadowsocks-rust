@@ -1,4 +1,4 @@
-//! This is a binary runing in the local environment
+//! This is a binary running in the local environment
 //!
 //! You have to provide all needed configuration attributes via command line parameters,
 //! or you could specify a configuration file. The format of configuration file is defined
@@ -23,10 +23,29 @@ use log::{LogLevelFilter, LogRecord};
 use shadowsocks::{Config, ConfigType, ServerAddr, ServerConfig, run_local};
 use shadowsocks::plugin::PluginConfig;
 
+fn log_time(without_time: bool, record: &LogRecord) -> String {
+    if without_time {
+        format!("[{}] {}", record.level(), record.args())
+    } else {
+        format!("[{}][{}] {}", time::now().strftime("%Y-%m-%d][%H:%M:%S.%f").unwrap(), record.level(), record.args())
+    }
+}
+
+fn log_time_module(without_time: bool, record: &LogRecord) -> String {
+    if without_time {
+        format!("[{}] [{}] {}", record.level(), record.location().module_path(), record.args())
+    } else {
+        format!("[{}][{}] [{}] {}",
+                time::now().strftime("%Y-%m-%d][%H:%M:%S.%f").unwrap(),
+                record.level(),
+                record.location().module_path(),
+                record.args())
+    }
+}
+
 fn main() {
     let matches = App::new("shadowsocks")
         .version(shadowsocks::VERSION)
-        .author("Y. T. Chung")
         .about("A fast tunnel proxy that helps you bypass firewalls.")
         .arg(Arg::with_name("VERBOSE")
                  .short("v")
@@ -64,67 +83,47 @@ fn main() {
         .arg(Arg::with_name("PLUGIN")
                  .long("plugin")
                  .takes_value(true)
-                 .help("Enable SIP003 plugin. (Experimental)"))
+                 .help("Enable SIP003 plugin"))
         .arg(Arg::with_name("PLUGIN_OPT")
                  .long("plugin-opts")
                  .takes_value(true)
-                 .help("Set SIP003 plugin options. (Experimental)"))
+                 .help("Set SIP003 plugin options"))
+        .arg(Arg::with_name("LOG_WITHOUT_TIME")
+                 .long("log-without-time")
+                 .help("Disable time in log"))
+        .arg(Arg::with_name("URL")
+                 .long("server-url")
+                 .takes_value(true)
+                 .help("Server address in SIP002 URL"))
         .get_matches();
 
     let mut log_builder = LogBuilder::new();
     log_builder.filter(None, LogLevelFilter::Info);
 
+    let without_time = matches.is_present("LOG_WITHOUT_TIME");
+
     let debug_level = matches.occurrences_of("VERBOSE");
     match debug_level {
         0 => {
             // Default filter
-            log_builder.format(|record: &LogRecord| {
-                                   format!("[{}][{}] {}",
-                                           time::now().strftime("%Y-%m-%d][%H:%M:%S").unwrap(),
-                                           record.level(),
-                                           record.args())
-                               });
+            log_builder.format(move |r| log_time(without_time, r));
         }
         1 => {
-            let mut log_builder = log_builder.format(|record: &LogRecord| {
-                                                         format!("[{}][{}] [{}] {}",
-                                                                 time::now().strftime("%Y-%m-%d][%H:%M:%S").unwrap(),
-                                                                 record.level(),
-                                                                 record.location().module_path(),
-                                                                 record.args())
-                                                     });
+            let log_builder = log_builder.format(move |r| log_time_module(without_time, r));
             log_builder.filter(Some("sslocal"), LogLevelFilter::Debug);
         }
         2 => {
-            let mut log_builder = log_builder.format(|record: &LogRecord| {
-                                                         format!("[{}][{}] [{}] {}",
-                                                                 time::now().strftime("%Y-%m-%d][%H:%M:%S").unwrap(),
-                                                                 record.level(),
-                                                                 record.location().module_path(),
-                                                                 record.args())
-                                                     });
+            let log_builder = log_builder.format(move |r| log_time_module(without_time, r));
             log_builder.filter(Some("sslocal"), LogLevelFilter::Debug)
                        .filter(Some("shadowsocks"), LogLevelFilter::Debug);
         }
         3 => {
-            let mut log_builder = log_builder.format(|record: &LogRecord| {
-                                                         format!("[{}][{}] [{}] {}",
-                                                                 time::now().strftime("%Y-%m-%d][%H:%M:%S").unwrap(),
-                                                                 record.level(),
-                                                                 record.location().module_path(),
-                                                                 record.args())
-                                                     });
+            let log_builder = log_builder.format(move |r| log_time_module(without_time, r));
             log_builder.filter(Some("sslocal"), LogLevelFilter::Trace)
                        .filter(Some("shadowsocks"), LogLevelFilter::Trace);
         }
         _ => {
-            let mut log_builder = log_builder.format(|record: &LogRecord| {
-                                                         format!("[{}][{}] [{}] {}",
-                                                                 time::now().strftime("%Y-%m-%d][%H:%M:%S").unwrap(),
-                                                                 record.level(),
-                                                                 record.location().module_path(),
-                                                                 record.args())
-                                                     });
+            let log_builder = log_builder.format(move |r| log_time_module(without_time, r));
             log_builder.filter(None, LogLevelFilter::Trace);
         }
     }
@@ -153,7 +152,7 @@ fn main() {
         None => Config::new(),
     };
 
-    let has_provided_server_config =
+    let mut has_provided_server_config =
         match (matches.value_of("SERVER_ADDR"), matches.value_of("PASSWORD"), matches.value_of("ENCRYPT_METHOD")) {
             (Some(svr_addr), Some(password), Some(method)) => {
                 let method = match method.parse() {
@@ -180,6 +179,14 @@ fn main() {
                 panic!("`server-addr`, `method` and `password` should be provided together");
             }
         };
+
+    if let Some(url) = matches.value_of("URL") {
+        let svr_addr = url.parse::<ServerConfig>().expect("Failed to parse `url`");
+
+        has_provided_server_config = true;
+
+        config.server.push(svr_addr);
+    }
 
     let has_provided_local_config = match matches.value_of("LOCAL_ADDR") {
         Some(local_addr) => {

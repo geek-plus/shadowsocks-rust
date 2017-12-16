@@ -70,37 +70,39 @@
 #![crate_type = "lib"]
 #![crate_name = "shadowsocks"]
 
-extern crate serde_json;
 #[macro_use]
 extern crate log;
-extern crate lru_cache;
-extern crate lru_time_cache;
-
+extern crate serde_json;
+extern crate base64;
+extern crate serde_urlencoded;
 extern crate byteorder;
 extern crate rand;
 extern crate typenum;
-
-extern crate md_5 as md5;
 extern crate digest;
-extern crate ring;
+#[cfg(feature = "miscreant")]
+extern crate miscreant;
+#[cfg(feature = "sodium")]
+extern crate libsodium_ffi;
+extern crate md_5 as md5;
 extern crate openssl;
-#[cfg(feature = "sodiumoxide")]
-extern crate sodiumoxide;
-
+extern crate ring;
+extern crate bytes;
 #[macro_use]
 extern crate futures;
+extern crate futures_cpupool;
 extern crate tokio_core;
 #[macro_use]
 extern crate tokio_io;
-extern crate netdb;
-extern crate bytes;
-
-extern crate libc;
+#[macro_use]
 extern crate lazy_static;
+extern crate libc;
 #[macro_use]
 extern crate scoped_tls;
-
 extern crate subprocess;
+#[cfg(any(unix, windows))]
+extern crate tokio_signal;
+extern crate byte_string;
+extern crate url;
 
 /// ShadowSocks version
 pub const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -114,3 +116,4 @@ pub mod config;
 pub mod relay;
 pub mod crypto;
 pub mod plugin;
+mod monitor;

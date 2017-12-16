@@ -12,6 +12,8 @@ use crypto::cipher::Error;
 
 use bytes::{BufMut, Bytes, BytesMut};
 
+use byte_string::ByteStr;
+
 
 /// AEAD ciphers provided by Ring
 pub enum RingAeadCryptoVariant {
@@ -55,32 +57,17 @@ impl RingAeadCipher {
         macro_rules! seal_or_open {
             ( $item:ident, $key:ident, $crypt:ident ) => {
                 RingAeadCryptoVariant::$item($key::new(&$crypt, key).unwrap(), Bytes::from(nonce))
+            };
+            ( $crypt:ident ) => {
+                if is_seal { seal_or_open!(Seal, SealingKey, $crypt) }
+                else { seal_or_open!(Open, OpeningKey, $crypt) }
             }
         }
 
         match t {
-            CipherType::Aes128Gcm => {
-                if is_seal {
-                    seal_or_open!(Seal, SealingKey, AES_128_GCM)
-                } else {
-                    seal_or_open!(Open, OpeningKey, AES_128_GCM)
-                }
-            }
-            CipherType::Aes256Gcm => {
-                if is_seal {
-                    seal_or_open!(Seal, SealingKey, AES_256_GCM)
-                } else {
-                    seal_or_open!(Open, OpeningKey, AES_256_GCM)
-                }
-            }
-            CipherType::ChaCha20Poly1305 => {
-                if is_seal {
-                    seal_or_open!(Seal, SealingKey, CHACHA20_POLY1305)
-                } else {
-                    seal_or_open!(Open, OpeningKey, CHACHA20_POLY1305)
-                }
-            }
-
+            CipherType::Aes128Gcm => seal_or_open!(AES_128_GCM),
+            CipherType::Aes256Gcm => seal_or_open!(AES_256_GCM),
+            CipherType::ChaCha20Poly1305 => seal_or_open!(CHACHA20_POLY1305),
             _ => panic!("unsupported cipher in ring {:?}", t),
         }
     }
@@ -106,15 +93,15 @@ impl AeadEncryptor for RingAeadCipher {
         let buf_len = input.len() + tag_len;
 
         let mut buf = BytesMut::with_capacity(buf_len);
-        buf.put(input);
+        buf.put_slice(input);
         unsafe {
             buf.set_len(buf_len);
         }
 
         if let RingAeadCryptoVariant::Seal(ref key, ref nonce) = self.cipher {
             seal_in_place(key, nonce, &[], &mut buf, tag_len).unwrap();
-            output.clone_from_slice(&buf[..input.len()]);
-            tag.clone_from_slice(&buf[input.len()..]);
+            output.copy_from_slice(&buf[..input.len()]);
+            tag.copy_from_slice(&buf[input.len()..]);
         } else {
             unreachable!("encrypt is called on a non-seal cipher");
         }
@@ -126,16 +113,23 @@ impl AeadEncryptor for RingAeadCipher {
 impl AeadDecryptor for RingAeadCipher {
     fn decrypt(&mut self, input: &[u8], output: &mut [u8], tag: &[u8]) -> CipherResult<()> {
         let mut buf = BytesMut::with_capacity(input.len() + tag.len());
-        buf.put(input);
-        buf.put(tag);
+        buf.put_slice(input);
+        buf.put_slice(tag);
 
         let r = if let RingAeadCryptoVariant::Open(ref key, ref nonce) = self.cipher {
             match open_in_place(key, nonce, &[], 0, &mut buf) {
                 Ok(buf) => {
-                    output.clone_from_slice(&buf[..input.len()]);
+                    output.copy_from_slice(&buf[..input.len()]);
                     Ok(())
                 }
-                Err(_) => Err(Error::AeadDecryptFailed),
+                Err(err) => {
+                    error!("AEAD decrypt failed, nonce={:?}, input={:?}, tag={:?}, err: {:?}",
+                           ByteStr::new(nonce),
+                           ByteStr::new(input),
+                           ByteStr::new(tag),
+                           err);
+                    Err(Error::AeadDecryptFailed)
+                }
             }
         } else {
             unreachable!("decrypt is called on a non-open cipher");

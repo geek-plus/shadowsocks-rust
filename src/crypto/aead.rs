@@ -3,6 +3,8 @@
 use crypto::cipher::{CipherCategory, CipherResult, CipherType};
 
 use crypto::ring::RingAeadCipher;
+#[cfg(feature = "miscreant")]
+use crypto::siv::MiscreantCipher;
 
 use ring::digest::SHA1;
 use ring::hkdf;
@@ -37,6 +39,10 @@ pub fn new_aead_encryptor(t: CipherType, key: &[u8], nonce: &[u8]) -> BoxAeadEnc
         CipherType::Aes256Gcm |
         CipherType::ChaCha20Poly1305 => Box::new(RingAeadCipher::new(t, key, nonce, true)),
 
+        #[cfg(feature = "miscreant")]
+        CipherType::Aes128PmacSiv |
+        CipherType::Aes256PmacSiv => Box::new(MiscreantCipher::new(t, key, nonce)),
+
         _ => unreachable!(),
     }
 }
@@ -49,6 +55,10 @@ pub fn new_aead_decryptor(t: CipherType, key: &[u8], nonce: &[u8]) -> BoxAeadDec
         CipherType::Aes128Gcm |
         CipherType::Aes256Gcm |
         CipherType::ChaCha20Poly1305 => Box::new(RingAeadCipher::new(t, key, nonce, false)),
+
+        #[cfg(feature = "miscreant")]
+        CipherType::Aes128PmacSiv |
+        CipherType::Aes256PmacSiv => Box::new(MiscreantCipher::new(t, key, nonce)),
 
         _ => unreachable!(),
     }
@@ -101,15 +111,21 @@ pub fn make_skey(t: CipherType, key: &[u8], salt: &[u8]) -> Bytes {
 /// Increase nonce by 1
 ///
 /// AEAD ciphers requires to increase nonce after encrypt/decrypt every chunk
+#[cfg(feature = "sodium")]
 pub fn increase_nonce(nonce: &mut [u8]) {
-    let mut adding = true;
-    for v in nonce.iter_mut() {
-        if !adding {
-            break;
-        }
+    use libsodium_ffi::sodium_increment;
 
-        let (r, overflow) = v.overflowing_add(1);
-        *v = r;
-        adding = overflow;
+    unsafe {
+        sodium_increment(nonce.as_mut_ptr(), nonce.len());
+    }
+}
+
+#[cfg(not(feature = "sodium"))]
+pub fn increase_nonce(nonce: &mut [u8]) {
+    let mut prev: u16 = 1;
+    for i in nonce {
+        prev += *i as u16;
+        *i = prev as u8;
+        prev >>= 8;
     }
 }

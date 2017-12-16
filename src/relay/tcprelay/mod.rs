@@ -1,28 +1,30 @@
 //! Relay for TCP implementation
 
 use std::io::{self, BufRead, Read};
+use std::iter::{IntoIterator, Iterator};
 use std::mem;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
 use config::{ServerAddr, ServerConfig};
 use crypto::CipherCategory;
-use relay::{BoxIoFuture, boxed_future};
+use relay::{boxed_future, BoxIoFuture};
 use relay::Context;
 use relay::dns_resolver::resolve;
 use relay::socks5::Address;
 
-use tokio_core::net::TcpStream;
+use tokio_core::net::{TcpStream, TcpStreamNew};
 use tokio_core::reactor::{Handle, Timeout};
 use tokio_io::AsyncRead;
 use tokio_io::io::{ReadHalf, WriteHalf};
 use tokio_io::io::{read_exact, write_all};
 
-use futures::{self, Future, Poll};
+use futures::{self, Async, Future, Poll};
 
 use bytes::{BufMut, BytesMut};
+
+use byte_string::ByteStr;
 
 pub use self::crypto_io::{DecryptedRead, EncryptedWrite};
 
@@ -153,6 +155,82 @@ pub type DecryptedHalfFut = BoxIoFuture<DecryptedHalf>;
 /// Boxed future of `EncryptedHalf`
 pub type EncryptedHalfFut = BoxIoFuture<EncryptedHalf>;
 
+/// Try to connect every IPs one by one
+enum TcpStreamConnect<I: Iterator<Item = SocketAddr>> {
+    Empty,
+    Connect {
+        last_err: Option<io::Error>,
+        addr_iter: I,
+        opt_stream_new: Option<(TcpStreamNew, SocketAddr)>,
+        handle: Handle,
+    },
+}
+
+impl<I: Iterator<Item = SocketAddr>> TcpStreamConnect<I> {
+    fn new(iter: I, handle: &Handle) -> TcpStreamConnect<I> {
+        TcpStreamConnect::Connect {
+            last_err: None,
+            addr_iter: iter,
+            opt_stream_new: None,
+            handle: handle.clone(),
+        }
+    }
+}
+
+impl<I: Iterator<Item = SocketAddr>> Future for TcpStreamConnect<I> {
+    type Item = TcpStream;
+    type Error = io::Error;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        use std::io::ErrorKind;
+
+        match *self {
+            TcpStreamConnect::Empty => unreachable!(),
+            TcpStreamConnect::Connect {
+                ref mut last_err,
+                ref mut addr_iter,
+                ref mut opt_stream_new,
+                ref handle,
+            } => {
+                loop {
+                    // 1. Poll before doing anything else
+                    if let Some((ref mut stream_new, ref addr)) = *opt_stream_new {
+                        match stream_new.poll() {
+                            Ok(Async::Ready(stream)) => return Ok(Async::Ready(stream)),
+                            Ok(Async::NotReady) => return Ok(Async::NotReady),
+                            Err(ref err) if err.kind() == ErrorKind::WouldBlock => return Ok(Async::NotReady),
+                            Err(err) => {
+                                error!("Failed to connect {}: {}", addr, err);
+                                
+                                *last_err = Some(err);
+                            }
+                        }
+                    }
+
+                    match addr_iter.next() {
+                        None => break,
+                        Some(addr) => {
+                            *opt_stream_new = Some((TcpStream::connect(&addr, &handle), addr));
+                        }
+                    }
+                }
+            }
+        }
+
+        match mem::replace(self, TcpStreamConnect::Empty) {
+            TcpStreamConnect::Empty => unreachable!(),
+            TcpStreamConnect::Connect { last_err, .. } => {
+                match last_err {
+                    None => {
+                        let err = io::Error::new(ErrorKind::Other, "connect TCP without any addresses");
+                        Err(err)
+                    }
+                    Some(err) => Err(err),
+                }
+            }
+        }
+    }
+}
+
 fn connect_proxy_server(svr_cfg: Rc<ServerConfig>) -> BoxIoFuture<TcpStream> {
     let timeout = *svr_cfg.timeout();
     trace!("Connecting to proxy {:?}, timeout: {:?}", svr_cfg.addr(), timeout);
@@ -165,17 +243,10 @@ fn connect_proxy_server(svr_cfg: Rc<ServerConfig>) -> BoxIoFuture<TcpStream> {
         }
         ServerAddr::DomainName(ref domain, port) => {
             let fut = Context::with(|ctx| {
-                let handle = ctx.handle();
-                try_timeout(resolve(&domain[..], &handle), timeout, &handle).and_then(move |sockaddr| {
-                    let sockaddr = match sockaddr {
-                        IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
-                        IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, 0)),
-                    };
-
-                    Context::with(|ctx| {
-                                      let handle = ctx.handle();
-                                      try_timeout(TcpStream::connect(&sockaddr, &handle), timeout, &handle)
-                                  })
+                let handle = ctx.handle().clone();
+                try_timeout(resolve(&domain[..], port, false), timeout, &handle).and_then(move |vec_ipaddr| {
+                    let fut = TcpStreamConnect::new(vec_ipaddr.into_iter(), &handle);
+                    try_timeout(fut, timeout, &handle)
                 })
             });
             boxed_future(fut)
@@ -189,13 +260,13 @@ pub fn proxy_server_handshake(remote_stream: TcpStream,
                               relay_addr: Address)
                               -> BoxIoFuture<(DecryptedHalfFut, EncryptedHalfFut)> {
     let timeout = *svr_cfg.timeout();
-    let fut = proxy_handshake(remote_stream, svr_cfg).and_then(move |(r_fut, w_fut)| {;
+    let fut = proxy_handshake(remote_stream, svr_cfg).and_then(move |(r_fut, w_fut)| {
         let w_fut = w_fut.and_then(move |enc_w| {
-            trace!("Got encrypt stream and going to send addr: {:?}", relay_addr);
-
             // Send relay address to remote
             let mut buf = BytesMut::with_capacity(relay_addr.len());
             relay_addr.write_to_buf(&mut buf);
+
+            trace!("Got encrypt stream and going to send addr: {:?}, buf: {:?}", relay_addr, buf);
 
             Context::with(|ctx| try_timeout(enc_w.write_all(buf), timeout, ctx.handle()).map(|(w, _)| w))
         });
@@ -211,7 +282,6 @@ pub fn proxy_handshake(remote_stream: TcpStream,
                        svr_cfg: Rc<ServerConfig>)
                        -> BoxIoFuture<(DecryptedHalfFut, EncryptedHalfFut)> {
     let fut = futures::lazy(|| Ok(remote_stream.split())).and_then(move |(r, w)| {
-
         let timeout = svr_cfg.timeout().clone();
 
         let svr_cfg_cloned = svr_cfg.clone();
@@ -236,22 +306,19 @@ pub fn proxy_handshake(remote_stream: TcpStream,
             };
 
             Context::with(|ctx| {
-                try_timeout(write_all(w, prev_buf), timeout, ctx.handle())
-                    .and_then(move |(w, prev_buf)| match svr_cfg.method().category() {
-                                  CipherCategory::Stream => {
-                                      let local_iv = prev_buf;
-                                      Ok(From::from(StreamEncryptedWriter::new(w,
-                                                                               svr_cfg.method(),
-                                                                               svr_cfg.key(),
-                                                                               &local_iv)))
-                                  }
-                                  CipherCategory::Aead => {
-                                      let local_salt = prev_buf;
-                                      let wtr =
-                                          AeadEncryptedWriter::new(w, svr_cfg.method(), svr_cfg.key(), &local_salt[..]);
-                                      Ok(From::from(wtr))
-                                  }
-                              })
+                try_timeout(write_all(w, prev_buf), timeout, ctx.handle()).and_then(
+                    move |(w, prev_buf)| match svr_cfg.method().category() {
+                        CipherCategory::Stream => {
+                            let local_iv = prev_buf;
+                            Ok(From::from(StreamEncryptedWriter::new(w, svr_cfg.method(), svr_cfg.key(), &local_iv)))
+                        }
+                        CipherCategory::Aead => {
+                            let local_salt = prev_buf;
+                            let wtr = AeadEncryptedWriter::new(w, svr_cfg.method(), svr_cfg.key(), &local_salt[..]);
+                            Ok(From::from(wtr))
+                        }
+                    },
+                )
             })
         };
 
@@ -267,20 +334,21 @@ pub fn proxy_handshake(remote_stream: TcpStream,
             };
 
             Context::with(|ctx| {
-                try_timeout(read_exact(r, vec![0u8; prev_len]), timeout, ctx.handle())
-                    .and_then(move |(r, remote_iv)| match svr_cfg.method().category() {
-                                  CipherCategory::Stream => {
-                                      trace!("Got initialize vector {:?}", remote_iv);
-                                      let decrypt_stream =
-                                          StreamDecryptedReader::new(r, svr_cfg.method(), svr_cfg.key(), &remote_iv);
-                                      Ok(From::from(decrypt_stream))
-                                  }
-                                  CipherCategory::Aead => {
-                                      trace!("Got salt {:?}", remote_iv);
-                                      let dr = AeadDecryptedReader::new(r, svr_cfg.method(), svr_cfg.key(), &remote_iv);
-                                      Ok(From::from(dr))
-                                  }
-                              })
+                try_timeout(read_exact(r, vec![0u8; prev_len]), timeout, ctx.handle()).and_then(
+                    move |(r, remote_iv)| match svr_cfg.method().category() {
+                        CipherCategory::Stream => {
+                            trace!("Got initialize vector {:?}", ByteStr::new(&remote_iv));
+                            let decrypt_stream =
+                                StreamDecryptedReader::new(r, svr_cfg.method(), svr_cfg.key(), &remote_iv);
+                            Ok(From::from(decrypt_stream))
+                        }
+                        CipherCategory::Aead => {
+                            trace!("Got salt {:?}", ByteStr::new(&remote_iv));
+                            let dr = AeadDecryptedReader::new(r, svr_cfg.method(), svr_cfg.key(), &remote_iv);
+                            Ok(From::from(dr))
+                        }
+                    },
+                )
             })
         };
 
