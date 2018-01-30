@@ -1,8 +1,8 @@
 //! Cipher defined with Miscreant
 
-use std::{iter, ptr};
+use std::ptr;
 
-use miscreant::{Aes128PmacSiv, Aes256PmacSiv};
+use miscreant::aead::{Aes128PmacSiv, Aes256PmacSiv, Algorithm};
 
 use crypto::{AeadDecryptor, AeadEncryptor};
 use crypto::{CipherResult, CipherType};
@@ -12,7 +12,6 @@ use crypto::cipher::Error;
 use bytes::{BufMut, BytesMut};
 
 use byte_string::ByteStr;
-
 
 /// AEAD ciphers provided by Miscreant
 pub enum MiscreantCryptoVariant {
@@ -42,10 +41,8 @@ impl MiscreantCipher {
 
         let skey = make_skey(t, key, salt);
         let cipher = Self::new_variant(t, &skey);
-        MiscreantCipher {
-            cipher: cipher,
-            nonce: nonce,
-        }
+        MiscreantCipher { cipher: cipher,
+                          nonce: nonce, }
     }
 
     fn new_variant(t: CipherType, key: &[u8]) -> MiscreantCryptoVariant {
@@ -78,12 +75,12 @@ impl AeadEncryptor for MiscreantCipher {
 
         match self.cipher {
             MiscreantCryptoVariant::Aes128(ref mut cipher) => {
-                cipher.seal_in_place(iter::once(&self.nonce), &mut buf);
+                cipher.seal_in_place(&self.nonce, b"", &mut buf);
                 tag.copy_from_slice(&buf[..tag_len]);
                 output.copy_from_slice(&buf[tag_len..]);
             }
             MiscreantCryptoVariant::Aes256(ref mut cipher) => {
-                cipher.seal_in_place(iter::once(&self.nonce), &mut buf);
+                cipher.seal_in_place(&self.nonce, b"", &mut buf);
                 tag.copy_from_slice(&buf[..tag_len]);
                 output.copy_from_slice(&buf[tag_len..]);
             }
@@ -100,8 +97,8 @@ impl AeadDecryptor for MiscreantCipher {
         buf.put_slice(input);
 
         let result = match self.cipher {
-            MiscreantCryptoVariant::Aes128(ref mut cipher) => cipher.open_in_place(iter::once(&self.nonce), &mut buf),
-            MiscreantCryptoVariant::Aes256(ref mut cipher) => cipher.open_in_place(iter::once(&self.nonce), &mut buf),
+            MiscreantCryptoVariant::Aes128(ref mut cipher) => cipher.open_in_place(&self.nonce, b"", &mut buf),
+            MiscreantCryptoVariant::Aes256(ref mut cipher) => cipher.open_in_place(&self.nonce, b"", &mut buf),
         };
 
         result.map(|buf| {
@@ -117,7 +114,6 @@ impl AeadDecryptor for MiscreantCipher {
                        })
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -139,8 +135,7 @@ mod test {
 
         let mut dec = MiscreantCipher::new(ct, &key[..], &iv[..]);
         let mut decrypted_msg = vec![0; encrypted_msg.len()];
-        dec.decrypt(&encrypted_msg[..], &mut decrypted_msg, &tag)
-           .unwrap();
+        dec.decrypt(&encrypted_msg[..], &mut decrypted_msg, &tag).unwrap();
 
         assert_eq!(&decrypted_msg[..], message);
     }
